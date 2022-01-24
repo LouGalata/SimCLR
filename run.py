@@ -5,6 +5,10 @@ from torchvision import models
 from data_aug.contrastive_learning_dataset import ContrastiveLearningDataset
 from models.resnet_simclr import ResNetSimCLR
 from simclr import SimCLR
+import numpy as np
+from utils import save_config_file
+from torch.utils.tensorboard import SummaryWriter
+from itertools import product
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -13,8 +17,8 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch SimCLR')
 parser.add_argument('-data', metavar='DIR', default='./datasets',
                     help='path to dataset')
-parser.add_argument('-dataset-name', default='stl10',
-                    help='dataset name', choices=['stl10', 'cifar10'])
+parser.add_argument('-dataset-name', default='laboratory',
+                    help='dataset name', choices=['stl10', 'cifar10', 'simulation_towels', 'laboratory'])
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
@@ -22,9 +26,11 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                          ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=12, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
+# parser.add_argument('--epochs', default=200, type=int, metavar='N',
+#                     help='number of total epochs to run')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=16, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -36,12 +42,12 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     dest='weight_decay')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--disable-cuda', action='store_true',
+parser.add_argument('--disable-cuda', action='store_false',
                     help='Disable CUDA')
 parser.add_argument('--fp16-precision', action='store_true',
                     help='Whether or not to use 16-bit precision GPU training.')
 
-parser.add_argument('--out_dim', default=128, type=int,
+parser.add_argument('--out_dim', default=32, type=int,
                     help='feature dimension (default: 128)')
 parser.add_argument('--log-every-n-steps', default=100, type=int,
                     help='Log every n steps')
@@ -66,23 +72,44 @@ def main():
 
     dataset = ContrastiveLearningDataset(args.data)
 
-    train_dataset = dataset.get_dataset(args.dataset_name, args.n_views)
+    # preprocessing()
+    train_dataset = dataset.get_dataset(args.dataset_name, args.n_views, rgb=False)
+    num_input_channel, _, _ = train_dataset[0][0][0].shape
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=True)
+    writer = SummaryWriter()
 
-    model = ResNetSimCLR(base_model=args.arch, out_dim=args.out_dim)
+    # save config file
+    save_config_file(writer.log_dir, args)
 
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    parameters = dict(
+        # lr=[0.001, 0.0001, 0.0003],
+        # batch_size=[16, 32, 64],
+        # out_dim=[32, 64, 128]
+        lr=[0.0003],
+        batch_size=[8, 16],
+        rgb=[False]
+    )
+    param_values = [v for v in parameters.values()]
+    print(param_values)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader), eta_min=0,
-                                                           last_epoch=-1)
+    for lr, bs, rgb in product(*param_values):
+        if not rgb:
+            num_input_channel = 1
+        model = ResNetSimCLR(base_model=args.arch, num_input_channel=num_input_channel)
 
-    #  It’s a no-op if the 'gpu_index' argument is a negative integer or None.
-    with torch.cuda.device(args.gpu_index):
-        simclr = SimCLR(model=model, optimizer=optimizer, scheduler=scheduler, args=args)
-        simclr.train(train_loader)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=bs, shuffle=True,
+            num_workers=args.workers, pin_memory=True, drop_last=True)
+        optimizer = torch.optim.Adam(model.parameters(), lr, weight_decay=args.weight_decay)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader), eta_min=0,
+                                                               last_epoch=-1)
+
+        #  It’s a no-op if the 'gpu_index' argument is a negative integer or None.
+        with torch.cuda.device(args.gpu_index):
+            simclr = SimCLR(model=model, optimizer=optimizer, scheduler=scheduler, writer=writer, learning_rate=lr,
+                            batch_size=bs, rgb=rgb, args=args)
+            simclr.train(train_loader)
 
 
 if __name__ == "__main__":
